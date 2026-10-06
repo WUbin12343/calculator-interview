@@ -17,16 +17,44 @@ jobs:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
-      - name: Invite new organization members
+      - name: Ensure organization invitation and rookies membership
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.XWMS_PAT_TOKEN }}
           script: |
             const org = context.repo.owner;
             const username = context.payload.pull_request.user.login;
+            const team_slug = 'rookies';
             const matchesUser = (item) =>
               typeof item.login === 'string' &&
               item.login.toLowerCase() === username.toLowerCase();
+
+            // 团队不存在或不可访问时停止，不降级为只邀请组织。
+            const { data: team } = await github.rest.teams.getByName({ org, team_slug });
+            if (!Number.isSafeInteger(team.id) || team.id <= 0) {
+              throw new Error('rookies 团队 ID 必须是正整数，停止操作。');
+            }
+
+            async function ensureTeamMembership() {
+              const members = await github.paginate(github.rest.teams.listMembersInOrg, {
+                org, team_slug, role: 'all', per_page: 100,
+              });
+              if (members.some(matchesUser)) {
+                // 不重复 PUT，避免把现有 maintainer 的角色改成 member。
+                core.info(`${username} 已在 ${team_slug}，跳过重复操作。`);
+                return;
+              }
+              const { data: membership } = await github.rest.teams.addOrUpdateMembershipForUserInOrg({
+                org, team_slug, username, role: 'member',
+              });
+              if (membership.state === 'active') {
+                core.info(`已将组织成员 ${username} 加入 ${team_slug}。`);
+              } else if (membership.state === 'pending') {
+                core.info(`${username} 的 ${team_slug} 成员关系待接受，尚未生效。`);
+              } else {
+                throw new Error('加入 rookies 后返回未知成员状态，请管理员核查。');
+              }
+            }
 
             // 分页查询，不把 404、权限或网络错误当成“尚未加入”。
             async function handleExistingUser() {
@@ -34,7 +62,7 @@ jobs:
                 org, per_page: 100,
               });
               if (members.some(matchesUser)) {
-                core.info(`${username} 已是组织成员，跳过邀请。`);
+                await ensureTeamMembership();
                 return true;
               }
 
@@ -44,7 +72,13 @@ jobs:
               );
               const invitation = invitations.find(matchesUser);
               if (invitation) {
-                core.info(`${username} 已有待接受的组织邀请，跳过重复邀请。`);
+                const teams = await github.paginate(github.rest.orgs.listInvitationTeams, {
+                  org, invitation_id: invitation.id, per_page: 100,
+                });
+                if (!teams.some((item) => item.id === team.id)) {
+                  throw new Error(`${username} 的待接受邀请未包含 ${team_slug}；请 Owner 补充团队安排。未取消或重发原邀请。`);
+                }
+                core.info(`${username} 已有包含 ${team_slug} 的邀请，等待本人接受，跳过重复邀请。`);
                 return true;
               }
               return false;
@@ -62,6 +96,7 @@ jobs:
                 org,
                 invitee_id: user.id,
                 role: 'direct_member',
+                team_ids: [team.id],
               });
             } catch (error) {
               // 查询后可能有另一任务或管理员发出邀请；重新确认状态再跳过。
@@ -69,4 +104,4 @@ jobs:
               if (error.status === 422 && await handleExistingUser()) return;
               throw error;
             }
-            core.info(`已向 ${username} 发送组织邀请，等待本人接受。`);
+            core.info(`已向 ${username} 发送包含 ${team_slug} 的组织邀请，等待本人接受。`);
