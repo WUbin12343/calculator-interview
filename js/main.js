@@ -1119,3 +1119,316 @@ cubeButton.className = 'key key--action';
 cubeButton.textContent = 'x³';
 cubeButton.addEventListener('click', inputCube);
 keyboard.appendChild(cubeButton);
+
+// =========================================
+// 新增：度 / 分 / 秒（° ′ ″）三个按键 —— 纯叠加，既有逻辑零改动
+// -----------------------------------------------------------------
+// 用法：数字 + ° 记度、+ ′ 记分、+ ″ 记秒并结束录入；漏录的分量按 0，
+//       空值直接点键也不报错。点 ″ 时若已有待运算符（+ − × ÷ …），就复用
+//       既有 inputEquals() 求值，结果按「度/分/秒各两位小数」显示；没有
+//       待运算符，该值直接作为当前操作数继续参与既有四则运算。
+// =========================================
+
+/** 度分秒串的形状：如 -40.00°51.00′0.00″（三个分量各两位小数） */
+const DMS_TEXT = /^(-)?(\d+(?:\.\d+)?)°(\d+(?:\.\d+)?)′(\d+(?:\.\d+)?)″$/;
+
+/**
+ * 十进制度 → 度分秒串；秒四舍五入到两位后若满 60，进位依次向分、度传递。
+ * @param {number} value 十进制度数
+ * @returns {string} 如 30.00°20.00′10.00″；非有限数返回「错误」
+ */
+function formatDms(value) {
+  if (!Number.isFinite(value)) {
+    return ERROR_TEXT;
+  }
+  const abs = Math.abs(value);
+  let deg = Math.floor(abs);
+  const rest = (abs - deg) * 60;
+  let min = Math.floor(rest);
+  let sec = Math.round((rest - min) * 6000) / 100;
+  if (sec >= 60) {
+    sec -= 60;
+    min += 1;
+  }
+  if (min >= 60) {
+    min -= 60;
+    deg += 1;
+  }
+  return `${value < 0 ? '-' : ''}${deg.toFixed(2)}°${min.toFixed(2)}′${sec.toFixed(2)}″`;
+}
+
+/**
+ * 度分秒串 → 十进制度。
+ * @param {string} str 形如 30.00°20.00′10.00″ 的文本
+ * @returns {number|null} 十进制度；不是度分秒串返回 null
+ */
+function parseDms(str) {
+  const m = DMS_TEXT.exec(String(str));
+  if (!m) {
+    return null;
+  }
+  return (m[1] === '-' ? -1 : 1) * (Number(m[2]) + Number(m[3]) / 60 + Number(m[4]) / 3600);
+}
+
+/** 主屏此刻显示的是不是度分秒串 */
+function isDmsDisplay() {
+  return DMS_TEXT.test(text);
+}
+
+// ---------------------------------------------------------------
+// 录入状态
+// ---------------------------------------------------------------
+let dmsParts = { deg: 0, min: 0, sec: 0 }; // 已录入的分量
+let dmsBuilding = false;   // 是否正在录入一个度分秒操作数
+let dmsNext = 'min';       // 主屏上还没标记的那个数是分还是秒
+let dmsSawPreview = false; // 本次按键消费掉的是「尚未输入」的预览串
+
+let dmsInvolved = false;   // 当前算式出现过度分秒 → 结果与算式行用度分秒写法
+let dmsRestoreText = null; // 按键前主屏原本显示的度分秒串
+let dmsPre = null;         // 按键前的 { acc, op, operand }，用于改写 = 的算式行
+
+// 算式行收尾用的度分秒写法：inputEquals 仍按十进制拼好并显示，
+// 冒泡阶段（dmsAfter）再用这份度分秒串覆写副屏
+let dmsPendingLine = null;
+
+/** 副屏里左操作数的写法：算式中出现过度分秒就用度分秒串，否则用十进制 */
+function dmsSide(value) {
+  if (!dmsInvolved || !Number.isFinite(value)) {
+    return formatResult(value);
+  }
+  const shown = formatDms(value);
+  return shown === ERROR_TEXT ? formatResult(value) : shown;
+}
+
+/** 录入期间副屏的前缀：有待运算符时保留「a + 」上下文 */
+function dmsPrefix() {
+  return pendingOp === null ? '' : `${dmsSide(acc)} ${pendingOp} `;
+}
+
+/** 把主屏预览成已录分量（未录的分量按 0）；下一个数字会整体替换它 */
+function dmsPreview(decimal) {
+  text = formatDms(decimal);
+  waiting = true;
+  show();
+}
+
+/** 本次要记的分量：预览串还没被新数字覆盖就按 0 记 */
+function dmsTake() {
+  const value = dmsSawPreview ? 0 : Number(text);
+  return Number.isFinite(value) ? value : 0;
+}
+
+/** 放弃未完成的录入：已录分量（含主屏上还没标记的数）折算成十进制写回主屏 */
+function dmsAbandon() {
+  const extra = Number.isFinite(Number(text)) ? Number(text) : 0;
+  const decimal = dmsNext === 'sec'
+    ? dmsParts.deg + dmsParts.min / 60 + extra / 3600
+    : dmsParts.deg + extra / 60;
+  dmsBuilding = false;
+  text = formatResult(decimal);
+  show();
+}
+
+/** 三个键的公共前置：错误态忽略；主屏是度分秒串就先还原成十进制 */
+function dmsPrepare() {
+  if (isError()) {
+    return false;
+  }
+  // 只有在「新开一份录入」时才重记本轮算式的原始写法。度分秒串刚录到一半时
+  // 主屏还是预览串，此刻不该覆盖已有的右操作数写法，否则 15°40′50″ 会被记成
+  // 半截的 50，副屏算式行就拼不出度分秒样式了。
+  if (!dmsBuilding) {
+    dmsPre = { acc, op: pendingOp, operand: text };
+  }
+  canRepeat = false;      // 开始度分秒录入，连算资格作废
+  dmsInvolved = true;     // 本次算式出现了度分秒操作数
+  dmsSawPreview = false;
+  if (isDmsDisplay()) {
+    text = formatResult(parseDms(text));
+    waiting = false;
+    dmsSawPreview = dmsBuilding; // 录入中被还原的是预览 → 这一分量还没输入
+    show();
+  }
+  return true;
+}
+
+/** 度键：把当前数字记为「度」，重开一份录入 */
+function inputDmsDegree() {
+  if (!dmsPrepare()) {
+    return;
+  }
+  dmsBuilding = true;
+  dmsNext = 'min';
+  dmsParts = { deg: dmsTake(), min: 0, sec: 0 };
+  showSub(`${dmsPrefix()}${dmsParts.deg}°`);
+  dmsPreview(dmsParts.deg);
+}
+
+/** 分键：把当前数字记为「分」；还没记过度就先把度按 0 算 */
+function inputDmsMinute() {
+  if (!dmsPrepare()) {
+    return;
+  }
+  if (!dmsBuilding) {
+    dmsBuilding = true;
+    dmsParts = { deg: 0, min: 0, sec: 0 };
+  }
+  dmsParts.min = dmsTake();
+  dmsNext = 'sec';
+  showSub(`${dmsPrefix()}${dmsParts.deg}°${dmsParts.min}′`);
+  dmsPreview(dmsParts.deg + dmsParts.min / 60);
+}
+
+/** 秒键：把当前数字记为「秒」并结束本次录入 */
+function inputDmsSecond() {
+  if (!dmsPrepare()) {
+    return;
+  }
+  if (!dmsBuilding) {
+    dmsBuilding = true;
+    dmsParts = { deg: 0, min: 0, sec: 0 };
+  }
+  dmsParts.sec = dmsTake();
+
+  const entered = `${dmsParts.deg}°${dmsParts.min}′${dmsParts.sec}″`;
+  const decimal = dmsParts.deg + dmsParts.min / 60 + dmsParts.sec / 3600;
+  dmsBuilding = false;
+
+  // 还没开始新算式（无待运算）时清掉挂起的改写项，避免旧算式行串到下一次运算
+  dmsPendingLine = null;
+  if (pendingOp === null) {
+    // 没有待运算：整值作为当前操作数，等运算符继续算
+    showSub(entered);
+    dmsPreview(decimal);
+    return;
+  }
+
+  // 有待运算：走既有 = 的流程（算式行、历史记录、错误态全部沿用）
+  const left = dmsSide(acc);
+  const op = pendingOp;
+  dmsPendingLine = `${left} ${op} ${entered} =`; // 算式行右侧直接用刚录入的度分秒串
+  text = formatResult(decimal); // 右操作数先写回主屏，供 inputEquals 消费
+  inputEquals();
+  if (isError()) {
+    return; // 如除以 0°0′0″：保持既有「错误」态
+  }
+  canRepeat = false; // 已由 ″ 收尾，再按一次 = 不该重复累加第二个操作数
+  showSub(dmsPendingLine);
+  dmsPreview(Number(text));
+}
+
+// ---------------------------------------------------------------
+// 与既有按键的兼容层：捕获阶段还原，冒泡阶段收尾
+// ---------------------------------------------------------------
+const DMS_EDIT_LABELS = ['.', '±', '⌫', '00']; // 编辑类键面（单个数字另行判断）
+const DMS_PHYS_KEYS = ['+', '-', '*', '/', 'Enter', '=', 'Escape', 'c', 'C'];
+const dmsButtons = [];
+
+/** 按键处理前：先快照状态，主屏是度分秒串就还原（录入中也把已录分量折算进来） */
+function dmsBefore(isEditKey) {
+  if (isEditKey && dmsBuilding) {
+    return; // 录入过程中的数字 / 小数点 / ± / 退格：直接作用于当前分量
+  }
+  // 只有「新的一轮按键」才重开快照；度分秒按键自身（dmsPrepare 里）已经记好了
+  // 本轮的原始左值/右值写法，这里不能覆盖，否则会把 15°40′50″ 记成 15.68…
+  if (!dmsBuilding) {
+    dmsPre = { acc, op: pendingOp, operand: text };
+  }
+  if (dmsBuilding) {
+    dmsAbandon();
+    if (dmsPre) {
+      dmsPre.operand = text; // 录入中断：用折算后的十进制，避免算式行里出现半截度分秒串
+    }
+  } else if (isDmsDisplay()) {
+    dmsRestoreText = text;
+    text = formatResult(parseDms(text));
+    show();
+  }
+}
+
+/** 按键既定处理跑完之后：值没动就把写法还回去，= 求值的结果转成度分秒 */
+function dmsAfter(label) {
+  if (label === 'C' || label === 'CE') {
+    dmsInvolved = false; // 本次算式到此为止
+  }
+  const snapshot = dmsRestoreText;
+  dmsRestoreText = null;
+  if (isError() || isDmsDisplay()) {
+    return; // 错误态或已经是度分秒串，无需收尾
+  }
+
+  // 值没被这次按键改动（如多按一次 = ，或按 + 只是把当前值挂成左操作数）：
+  // 把度分秒写法原样还回去，避免界面在「串 ↔ 小数」之间来回跳
+  const before = snapshot === null ? null : parseDms(snapshot);
+  if (before !== null && text === formatResult(before)) {
+    text = snapshot;
+    if (pendingOp !== null) {
+      showSub(`${snapshot} ${pendingOp}`);
+    }
+    show();
+    return;
+  }
+
+  // = 求值：算式里出现过度分秒，结果也按度分秒显示（各分量两位小数），
+  // 并把算式行改写成同一套写法；收尾后结束连算，再按 = 不会重复累加
+  if (label === '=' && dmsInvolved && Number.isFinite(Number(text))) {
+    text = formatDms(Number(text));
+    if (dmsPendingLine !== null) {
+      showSub(dmsPendingLine); // 录入时已算好的度分秒算式行，优先用它
+    } else if (dmsPre && dmsPre.op !== null) {
+      showSub(`${dmsSide(dmsPre.acc)} ${dmsPre.op} ${dmsSide(dmsPre.operand)} =`);
+    }
+    canRepeat = false;
+    dmsPendingLine = null;
+    show();
+  }
+}
+
+keyboard.addEventListener('click', (event) => {
+  const btn = event.target && event.target.closest ? event.target.closest('button') : null;
+  if (!btn || dmsButtons.indexOf(btn) !== -1) {
+    return; // 不在按钮上，或是度/分/秒键本身（由各自 handler 处理）
+  }
+  const label = btn.textContent;
+  dmsBefore(/^\d$/.test(label) || DMS_EDIT_LABELS.indexOf(label) !== -1);
+}, true);
+
+keyboard.addEventListener('click', (event) => {
+  const btn = event.target && event.target.closest ? event.target.closest('button') : null;
+  if (!btn || dmsButtons.indexOf(btn) !== -1) {
+    return;
+  }
+  dmsAfter(btn.textContent);
+});
+
+document.addEventListener('keydown', (event) => {
+  const key = event.key;
+  if (DMS_PHYS_KEYS.indexOf(key) === -1) {
+    return; // 既有监听根本不处理的键，不多管闲事
+  }
+  dmsBefore(key === '.' || key === 'Backspace' || (key >= '0' && key <= '9'));
+}, true);
+
+document.addEventListener('keydown', (event) => {
+  const key = event.key;
+  if (DMS_PHYS_KEYS.indexOf(key) === -1) {
+    return;
+  }
+  const physical = key === 'Enter' || key === '=' ? '=' : key === 'Escape' || key.toLowerCase() === 'c' ? 'C' : key;
+  dmsAfter(physical);
+});
+
+// 三个键沿用既有 .key .key--action 样式追加（同 BIN/OCT/HEX 的做法，
+// 不动 LAYOUT / KEY_CLASS——static-check 白名单未收录新 kind）
+[['°', inputDmsDegree, '度'], ['′', inputDmsMinute, '分'], ['″', inputDmsSecond, '秒']].forEach(
+  ([label, handler, name]) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'key key--action';
+    button.textContent = label;
+    button.title = `${name}（度分秒）`; // 悬停提示，不影响键面可访问名称
+    button.addEventListener('click', handler);
+    dmsButtons.push(button);
+    keyboard.appendChild(button);
+  },
+);
